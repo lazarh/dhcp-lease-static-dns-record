@@ -15,9 +15,8 @@
 :local lastResort ("dev-" . [:pick $ipStr ($d3 + 1)])
 
 :if ($lBound = 0) do={
-    :local recRelease [/ip dns static find where address=$lIP comment="DHCP-Auto"]
-    :if ([:len $recRelease] > 0) do={
-        /ip dns static remove $recRelease
+    :foreach entry in=[/ip dns static find where address=$lIP comment="DHCP-Auto"] do={
+        /ip dns static remove $entry
     }
     :log info "DHCP-DNS: Removed DNS record for $lIP"
 } else={
@@ -88,13 +87,11 @@
 
     :local fqdn ($safe . "." . $topdomain)
 
-    :local recFqdn [/ip dns static find where name=$fqdn]
-    :if ([:len $recFqdn] > 0) do={
-        /ip dns static remove $recFqdn
+    :foreach entry in=[/ip dns static find where name=$fqdn] do={
+        /ip dns static remove $entry
     }
-    :local recIP [/ip dns static find where address=$lIP comment="DHCP-Auto"]
-    :if ([:len $recIP] > 0) do={
-        /ip dns static remove $recIP
+    :foreach entry in=[/ip dns static find where address=$lIP comment="DHCP-Auto"] do={
+        /ip dns static remove $entry
     }
     /ip dns static add name=$fqdn address=$lIP comment="DHCP-Auto" ttl=00:10:00
 

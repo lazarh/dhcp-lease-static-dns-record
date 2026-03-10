@@ -1,6 +1,6 @@
 # dhcp-lease-static-dns-record
 
-MikroTik RouterOS v7 DHCP lease script that automatically creates and removes
+MikroTik RouterOS DHCP lease script that automatically creates and removes
 static DNS A-records whenever a client receives or releases a lease.
 
 ---
@@ -12,7 +12,7 @@ problems prevent a naïve implementation from working:
 
 1. **Empty `leaseHostName`** – Many clients never send DHCP option 12, so the
    hostname variable is always empty.
-2. **Empty `leaseClientMac`** – On some RouterOS v7 builds the MAC-address
+2. **Empty `leaseClientMac`** – On some RouterOS builds the MAC-address
    environment variable is not populated (confirmed in logs showing `MAC=`).
 
 Both issues are addressed in [`dhcp-lease-dns.rsc`](dhcp-lease-dns.rsc).
@@ -24,7 +24,7 @@ Both issues are addressed in [`dhcp-lease-dns.rsc`](dhcp-lease-dns.rsc).
 | Feature | Detail |
 |---|---|
 | Hostname from client | Uses DHCP option 12 when the client provides it |
-| MAC-address fallback | Falls back to `dev-AABBCC` (first 3 MAC octets) when no hostname |
+| MAC-address fallback | Falls back to `dev-AABBCC` (first 3 MAC octets) when no hostname, lowercased to `dev-aabbcc` in the final DNS record |
 | Lease-table MAC lookup | When `leaseClientMac` env var is empty, reads the MAC from `/ip dhcp-server lease` |
 | Last-resort name | Uses `dev-<last-IP-octet>` if MAC is also unavailable |
 | Hostname sanitisation | Strips characters that are invalid in DNS labels; converts to lower-case |
@@ -33,30 +33,58 @@ Both issues are addressed in [`dhcp-lease-dns.rsc`](dhcp-lease-dns.rsc).
 
 ---
 
-## Quick start
+## Setup (recommended — named script approach)
 
-1. Open **Winbox / WebFig** → **IP → DHCP Server**.
-2. Double-click your DHCP server entry.
-3. Open the **"Lease Script"** tab (or field).
-4. Paste the entire contents of [`dhcp-lease-dns.rsc`](dhcp-lease-dns.rsc).
-5. Change the `topdomain` variable at the top to match your local domain, e.g.
-   ```
-   :local topdomain "home.local"
-   ```
-6. Click **Apply / OK**.
+The cleanest way to deploy is to store the script in RouterOS's script
+repository (`/system script`) and reference it by name from the DHCP
+server.  This avoids all inline-escaping problems and script-length limits
+that appear when the script is pasted directly into the `lease-script` field.
 
-### CLI alternative
+### Step 1 — customise the domain
+
+Edit the first line of `dhcp-lease-dns.rsc` to match your local domain:
 
 ```rsc
-/ip dhcp-server set <server-name> \
-    lease-script=[/file get [find name=dhcp-lease-dns.rsc] contents]
+:local topdomain "home.local"
 ```
 
-Or paste the script inline:
+### Step 2 — upload the script to the router
+
+**Via Winbox / WebFig file manager**
+
+1. Upload `dhcp-lease-dns.rsc` to the router's file system (drag-and-drop in
+   the **Files** window, or use FTP/SCP/SFTP).
+2. In a terminal, import it as a named script:
 
 ```rsc
-/ip dhcp-server set defconf lease-script="..."
+/system script add name=dhcp-lease-dns \
+    source=[/file get [find name="dhcp-lease-dns.rsc"] contents]
 ```
+
+**Via SSH / CLI directly**
+
+Paste the file contents as the `source` parameter:
+
+```rsc
+/system script add name=dhcp-lease-dns policy=read,write,test source="<paste full contents here>"
+```
+
+### Step 3 — point the DHCP server at the script
+
+```rsc
+/ip dhcp-server set defconf lease-script="/system script run dhcp-lease-dns"
+```
+
+Replace `defconf` with the name of your DHCP server entry.
+
+---
+
+## Setup (alternative — inline paste)
+
+If you prefer not to use a named script, paste the entire contents of
+`dhcp-lease-dns.rsc` directly into the **Lease Script** field in Winbox /
+WebFig → **IP → DHCP Server** → double-click your server → **Lease Script**
+tab.
 
 ---
 
@@ -73,7 +101,7 @@ DHCP event
             │
             ├─ pick hostname
             │       ├─ leaseHostName (if non-empty)
-            │       └─ dev-AABBCC   (first 3 octets of MAC)
+            │       └─ dev-AABBCC   (first 3 octets of MAC, lowercased to dev-aabbcc)
             │
             ├─ sanitise: keep [a-zA-Z0-9-], lowercase, strip leading/trailing hyphens
             │
@@ -95,7 +123,7 @@ DHCP-DNS: Added mylaptop.house.local -> 192.168.88.50
 No hostname (MAC fallback):
 ```
 DHCP-DNS: Bound=1 IP=192.168.88.51 MAC=AA:BB:CC:DD:EE:FF Host= Server=defconf
-DHCP-DNS: No hostname from 192.168.88.51, using fallback: dev-aabbcc
+DHCP-DNS: No hostname from 192.168.88.51, using fallback: dev-AABBCC
 DHCP-DNS: Added dev-aabbcc.house.local -> 192.168.88.51
 ```
 
@@ -109,10 +137,11 @@ DHCP-DNS: Removed DNS record for 192.168.88.50
 
 ## Requirements
 
-* RouterOS **v7.x** (tested against v7.20)
-* `:tolower` built-in — available in RouterOS v7
+* RouterOS **v6.x or v7.x**
 * Script permissions: the DHCP server runs the lease script under the
   `full` policy by default; no extra configuration needed.
+* No external commands are used — in particular, `:tolower` is **not** required
+  (case conversion is done with a built-in character loop).
 
 ---
 
@@ -124,3 +153,4 @@ DHCP-DNS: Removed DNS record for 192.168.88.50
 | DNS record created as `dev-.house.local` | Empty MAC AND lease table lookup failed | Check `/ip dhcp-server lease print` while lease is active |
 | Record not removed on release | Client released before script ran, or script error | Check `/log print` for `DHCP-DNS:` entries |
 | Hostname contains spaces/special chars | Some clients send option 12 with odd characters | Sanitisation step replaces them with `-` |
+
