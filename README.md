@@ -7,15 +7,19 @@ static DNS A-records whenever a client receives or releases a lease.
 
 ## Problem it solves
 
-MikroTik's DHCP server can run a script on every lease event, but two common
-problems prevent a naïve implementation from working:
+MikroTik's DHCP server can run a script on every lease event, but the built-in
+lease variables (`$leaseActIP`, `$leaseBound`, etc.) are only available when
+the script content is executed **directly** inside the `lease-script` field.
+If `lease-script` is set to `/system script run <name>`, RouterOS runs the
+named script in its own isolated context and those variables are **not**
+passed through — they are all empty, so any script that relies on them silently
+fails.
 
-1. **Empty `leaseHostName`** – Many clients never send DHCP option 12, so the
-   hostname variable is always empty.
-2. **Empty `leaseClientMac`** – On some RouterOS builds the MAC-address
-   environment variable is not populated (confirmed in logs showing `MAC=`).
-
-Both issues are addressed in [`dhcp-lease-dns.rsc`](dhcp-lease-dns.rsc).
+[`dhcp-lease-dns.rsc`](dhcp-lease-dns.rsc) avoids this entirely by reading
+from the DHCP lease table directly (inspired by
+[MichaelPaddon/routeros-scripts](https://github.com/MichaelPaddon/routeros-scripts)).
+It never touches the event environment variables, so it works correctly when
+called via `/system script run`, inline, or from a scheduler.
 
 ---
 
@@ -23,22 +27,18 @@ Both issues are addressed in [`dhcp-lease-dns.rsc`](dhcp-lease-dns.rsc).
 
 | Feature | Detail |
 |---|---|
-| Hostname from client | Uses DHCP option 12 when the client provides it |
-| MAC-address fallback | Falls back to `dev-AABBCC` (first 3 MAC octets) when no hostname, lowercased to `dev-aabbcc` in the final DNS record |
-| Lease-table MAC lookup | When `leaseClientMac` env var is empty, reads the MAC from `/ip dhcp-server lease` |
+| No env-var dependency | Reads `/ip dhcp-server lease` directly — works via `/system script run` or inline |
+| Hostname from client | Uses the `host-name` field from the lease (DHCP option 12) when present |
+| MAC-address fallback | Falls back to `dev-aabbcc` (first 3 MAC octets, lowercased) when no hostname |
 | Last-resort name | Uses `dev-<last-IP-octet>` if MAC is also unavailable |
 | Hostname sanitisation | Strips characters that are invalid in DNS labels; converts to lower-case |
-| Stale-record cleanup | Removes any previous record for the same IP **or** FQDN before adding the new one |
-| Lease release | Removes the record when the lease is released (`leaseBound=0`) |
+| Stale-record cleanup | Removes any previous auto-record for the same IP or FQDN before adding |
+| Expired-lease cleanup | Removes DNS records for leases no longer in the DHCP lease table |
+| Manual-record safety | Never overwrites a DNS record that was not created by this script |
 
 ---
 
-## Setup (recommended — named script approach)
-
-The cleanest way to deploy is to store the script in RouterOS's script
-repository (`/system script`) and reference it by name from the DHCP
-server.  This avoids all inline-escaping problems and script-length limits
-that appear when the script is pasted directly into the `lease-script` field.
+## Setup
 
 ### Step 1 — customise the domain
 
@@ -77,6 +77,16 @@ Paste the file contents as the `source` parameter:
 
 Replace `defconf` with the name of your DHCP server entry.
 
+### Step 4 (optional) — add a periodic sync job
+
+Lease releases remove the DNS record on the next event. To guarantee cleanup
+even when no further events occur, add a scheduler entry:
+
+```rsc
+/system scheduler add name=dhcp-dns-sync interval=5m \
+    on-event="/system script run dhcp-lease-dns"
+```
+
 ---
 
 ## Setup (alternative — inline paste)
@@ -91,46 +101,46 @@ tab.
 ## How it works
 
 ```
-DHCP event
+DHCP event (or scheduler tick)
     │
-    ├─ leaseBound=0 ──► remove A-record for that IP ──► done
-    │
-    └─ leaseBound=1
+    └─ read all entries from /ip dhcp-server lease
             │
-            ├─ resolve MAC (env var → lease table → warning)
-            │
-            ├─ pick hostname
-            │       ├─ leaseHostName (if non-empty)
-            │       └─ dev-AABBCC   (first 3 octets of MAC, lowercased to dev-aabbcc)
+            ├─ for each lease: derive FQDN
+            │       ├─ host-name field (if non-empty)
+            │       └─ dev-aabbcc (first 3 octets of MAC, lowercased)
             │
             ├─ sanitise: keep [a-zA-Z0-9-], lowercase, strip leading/trailing hyphens
             │
-            └─ register: remove stale records, add new A-record
-                         name=<hostname>.<topdomain> address=<leasedIP>
-                         comment="DHCP-Auto" ttl=10m
+            ├─ add/update A-record for each lease
+            │       comment="DHCP-Auto"  ttl=10m
+            │       (skips names that already have a manually-created record)
+            │
+            └─ remove any "DHCP-Auto" records with no matching lease
 ```
 
 ---
 
 ## Log output
 
-Successful bind:
+New lease assigned:
 ```
-DHCP-DNS: Bound=1 IP=192.168.88.50 MAC=AA:BB:CC:DD:EE:FF Host=mylaptop Server=defconf
-DHCP-DNS: Added mylaptop.house.local -> 192.168.88.50
+DHCP-DNS: Starting sync
+DHCP-DNS: Add mylaptop.house.local -> 192.168.88.50
+DHCP-DNS: Sync complete
 ```
 
 No hostname (MAC fallback):
 ```
-DHCP-DNS: Bound=1 IP=192.168.88.51 MAC=AA:BB:CC:DD:EE:FF Host= Server=defconf
-DHCP-DNS: No hostname from 192.168.88.51, using fallback: dev-AABBCC
-DHCP-DNS: Added dev-aabbcc.house.local -> 192.168.88.51
+DHCP-DNS: Starting sync
+DHCP-DNS: Add dev-aabbcc.house.local -> 192.168.88.51
+DHCP-DNS: Sync complete
 ```
 
-Release:
+Lease released / expired:
 ```
-DHCP-DNS: Bound=0 IP=192.168.88.50 MAC= Host= Server=defconf
-DHCP-DNS: Removed DNS record for 192.168.88.50
+DHCP-DNS: Starting sync
+DHCP-DNS: Remove mylaptop.house.local
+DHCP-DNS: Sync complete
 ```
 
 ---
@@ -149,8 +159,9 @@ DHCP-DNS: Removed DNS record for 192.168.88.50
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Host=` and `MAC=` both empty on bind | RouterOS is not populating env vars | Script already falls back to lease table for MAC |
-| DNS record created as `dev-.house.local` | Empty MAC AND lease table lookup failed | Check `/ip dhcp-server lease print` while lease is active |
-| Record not removed on release | Client released before script ran, or script error | Check `/log print` for `DHCP-DNS:` entries |
+| All vars empty (`Bound= IP= MAC=`) in old logs | Old version depended on DHCP env vars; `/system script run` does not pass them | Update to current version which reads the lease table directly |
+| DNS record not added after a bind event | Lease is in the table but sanitised hostname is empty | Check `/ip dhcp-server lease print` — does the lease have an address and MAC? |
+| Record not removed immediately on release | Lease still present in table when script runs | Run the script via scheduler every 5 minutes (Step 4) for guaranteed cleanup |
 | Hostname contains spaces/special chars | Some clients send option 12 with odd characters | Sanitisation step replaces them with `-` |
+| A manually-created DNS record is not overwritten | By design — script only manages records tagged `comment=DHCP-Auto` | Remove the manual record if you want the script to manage it |
 

@@ -1,52 +1,39 @@
 :local topdomain "house.local"
+:local magic    "DHCP-Auto"
+:local ttl      00:10:00
 
-:local lIP      $leaseActIP
-:local lHost    $leaseHostName
-:local lBound   $leaseBound
-:local lMac     $leaseClientMac
-:local lServer  $leaseServerName
+:log info "DHCP-DNS: Starting sync"
 
-:log info "DHCP-DNS: Bound=$lBound IP=$lIP MAC=$lMac Host=$lHost Server=$lServer"
+:local desired [:toarray ""]
 
-:local ipStr    [:tostr $lIP]
-:local d1       [:find $ipStr "."]
-:local d2       [:find $ipStr "." ($d1 + 1)]
-:local d3       [:find $ipStr "." ($d2 + 1)]
-:local lastResort ("dev-" . [:pick $ipStr ($d3 + 1)])
+/ip dhcp-server lease
+:foreach lease in=[find] do={
+    :local lIP   [get value-name=address $lease]
+    :local lHost [get value-name=host-name $lease]
+    :local lMac  [get value-name=mac-address $lease]
 
-:if ($lBound = 0) do={
-    :foreach entry in=[/ip dns static find where address=$lIP comment="DHCP-Auto"] do={
-        /ip dns static remove $entry
-    }
-    :log info "DHCP-DNS: Removed DNS record for $lIP"
-} else={
-    :if ([:len $lMac] = 0) do={
-        :do {
-            :set lMac [/ip dhcp-server lease get \
-                [/ip dhcp-server lease find where active-address=$lIP] \
-                active-mac-address]
-        } on-error={
-            :log warning "DHCP-DNS: Cannot resolve MAC for $lIP from lease table"
-        }
-    }
+    :local ipStr    [:tostr $lIP]
+    :local d1       [:find $ipStr "."]
+    :local d2       [:find $ipStr "." ($d1 + 1)]
+    :local d3       [:find $ipStr "." ($d2 + 1)]
+    :local lastResort ("dev-" . [:pick $ipStr ($d3 + 1)])
 
     :local finalHost ""
-
     :if ([:len $lHost] > 0) do={
         :set finalHost $lHost
     } else={
         :if ([:len $lMac] >= 8) do={
             :set finalHost ("dev-" . [:pick $lMac 0 2] . [:pick $lMac 3 5] . [:pick $lMac 6 8])
+            :log info "DHCP-DNS: $lIP no hostname, using MAC fallback: $finalHost"
         } else={
             :set finalHost $lastResort
-            :log warning "DHCP-DNS: No MAC for $lIP, using last-resort name: $finalHost"
+            :log warning "DHCP-DNS: $lIP no hostname or MAC, using last-resort: $finalHost"
         }
-        :log info "DHCP-DNS: No hostname from $lIP, using fallback: $finalHost"
     }
 
-    :local safe     ""
-    :local allowed  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
-    :local hostLen  [:len $finalHost]
+    :local safe    ""
+    :local allowed "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+    :local hostLen [:len $finalHost]
     :if ($hostLen >= 1) do={
         :for i from=0 to=($hostLen - 1) do={
             :local ch [:pick $finalHost $i ($i + 1)]
@@ -67,7 +54,7 @@
 
     :if ([:len $safe] = 0) do={
         :set safe $lastResort
-        :log warning "DHCP-DNS: Sanitised hostname is empty for $lIP, using $safe"
+        :log warning "DHCP-DNS: $lIP sanitised hostname empty, using last-resort: $safe"
     }
 
     :local upper "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -85,15 +72,34 @@
     }
     :set safe $safeLower
 
-    :local fqdn ($safe . "." . $topdomain)
-
-    :foreach entry in=[/ip dns static find where name=$fqdn] do={
-        /ip dns static remove $entry
+    :if ([:len $safe] > 0) do={
+        :local fqdn ($safe . "." . $topdomain)
+        :set ($desired->$fqdn) $lIP
     }
-    :foreach entry in=[/ip dns static find where address=$lIP comment="DHCP-Auto"] do={
-        /ip dns static remove $entry
-    }
-    /ip dns static add name=$fqdn address=$lIP comment="DHCP-Auto" ttl=00:10:00
-
-    :log info "DHCP-DNS: Added $fqdn -> $lIP"
 }
+
+:foreach fqdn,lIP in=$desired do={
+    :if ([:len [/ip dns static find where name=$fqdn address=$lIP comment=$magic]] = 0) do={
+        :foreach entry in=[/ip dns static find where name=$fqdn comment=$magic] do={
+            /ip dns static remove $entry
+        }
+        :foreach entry in=[/ip dns static find where address=$lIP comment=$magic] do={
+            /ip dns static remove $entry
+        }
+        :if ([:len [/ip dns static find where name=$fqdn]] = 0) do={
+            :log info "DHCP-DNS: Add $fqdn -> $lIP"
+            /ip dns static add name=$fqdn address=$lIP comment=$magic ttl=$ttl
+        }
+    }
+}
+
+/ip dns static
+:foreach entry in=[find where comment=$magic] do={
+    :local fqdn [get value-name=name $entry]
+    :if ([:len ($desired->$fqdn)] = 0) do={
+        :log info "DHCP-DNS: Remove $fqdn"
+        remove $entry
+    }
+}
+
+:log info "DHCP-DNS: Sync complete"
