@@ -37,8 +37,13 @@
 
 # Pre-compute a last-resort name from the last IP octet (e.g. "dev-50").
 # Used in two places below, so defined once here.
-:local ipOctets    [:toarray [:tostr $lIP] delimiter="."]
-:local lastResort  ("dev-" . ($ipOctets->3))
+# ":toarray … delimiter" syntax is not supported in RouterOS; use chained
+# :find calls to locate the three dots and slice the last octet instead.
+:local ipStr    [:tostr $lIP]
+:local d1       [:find $ipStr "."]
+:local d2       [:find $ipStr "." ($d1 + 1)]
+:local d3       [:find $ipStr "." ($d2 + 1)]
+:local lastResort ("dev-" . [:pick $ipStr ($d3 + 1)])
 
 # ── Lease release ─────────────────────────────────────────────────────────────
 :if ($lBound = 0) do={
